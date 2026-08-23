@@ -4,7 +4,7 @@ A **20 W battery-less DC microgrid** designed for residential DC applications us
 
 ## 📌 Project Overview
 
-This project presents the design and implementation of a **supercapacitor-assisted DC microgrid** for residential applications. The system is designed to supply a regulated **12 V DC bus** to DC loads while reducing the dependence on conventional batteries.
+This project presents the design and implementation of a **supercapacitor-assisted DC microgrid** for residential applications. The system is designed to supply a regulated ** DC bus** to DC loads while reducing the dependence on conventional batteries.
 
 Solar energy is processed through a **synchronous buck converter with MPPT control**, while a supercapacitor bank provides short-term energy storage and buffering. When the available solar and stored energy are insufficient to maintain the required DC-bus voltage, the system automatically switches to **AC-grid backup**.
 
@@ -19,10 +19,10 @@ The system eliminates battery-related issues such as degradation, limited cycle 
                        │
                        ▼
             ┌─────────────────────┐
-            │ Synchronous Buck     │
-            │ Converter + MPPT     │
-            │ ESP32 Controller      │
-            └──────────┬───────────┘
+            │ Synchronous Buck    │
+            │ Converter + MPPT    │
+            │ ESP32 Controller    │
+            └──────────┬──────────┘
                        │
                        ▼
               ┌────────────────┐
@@ -33,8 +33,8 @@ The system eliminates battery-related issues such as degradation, limited cycle 
                       │
                       ▼
               ┌────────────────┐
-              │ XL4016 Buck     │
-              │   Converter     │
+              │ XL4016 Buck    │
+              │   Converter    │
               └───────┬────────┘
                       │
                       ▼
@@ -259,32 +259,6 @@ ST_NORMAL
 
 ---
 
-## 📁 Repository Structure
-
-```text
-SC-DC-Microgrid/
-│
-├── Firmware/
-│   ├── MPPT_Controller/
-│   └── Protection/
-│
-├── Hardware/
-│   ├── Circuit_Diagram/
-│   ├── PCB/
-│   └── Components/
-│
-├── Simulation/
-│
-├── Documentation/
-│   ├── Thesis/
-│   └── Reports/
-│
-├── Images/
-│
-└── README.md
-```
-
----
 
 ## 🔬 Experimental Validation
 
