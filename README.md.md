@@ -45,7 +45,7 @@ What we wanted to test was whether that assumption holds up at the scale of a si
 ## How the system works
 
 <div align="center">
-<img src="block_diagram.jpg" alt="System block diagram" width="520">
+
 
 <sub>Block diagram of the supercapacitor-assisted DC microgrid.</sub>
 </div>
@@ -53,7 +53,7 @@ What we wanted to test was whether that assumption holds up at the scale of a si
 Solar power comes in through a synchronous buck converter, which does two things at once: it regulates the variable panel voltage into a stable DC bus, and it charges the supercapacitor bank. An ESP32 sits at the center of the whole system, reading photovoltaic voltage and current, supercapacitor voltage, bus voltage, and load current through a pair of INA219 sensors, and using those readings to decide — moment to moment, with no human involved — which of three operating modes the system should be in.
 
 <div align="center">
-<img src="media/pcb_labeled.jpg" alt="Labeled PCB" width="600">
+
 
 <sub>The assembled prototype board, with the main functional blocks labeled.</sub>
 </div>
@@ -91,10 +91,7 @@ We tested the system in three stages, each one closer to the full real-world con
 | System with PV, no supercapacitor | 78.92% | Direct solar input, MPPT active |
 | **Full system — PV + supercapacitor** | **81.42%** | Complete proposed architecture |
 
-<div align="center">
-<img src="media/efficiency_buck.jpg" alt="Buck converter efficiency" width="380">&nbsp;&nbsp;
-<img src="media/efficiency_system.jpg" alt="System efficiency" width="380">
-</div>
+
 
 The supercapacitor consistently added 2–3 percentage points of efficiency over the unbuffered setup across the whole voltage range we tested — most likely because the bank absorbs a good deal of the switching-frequency ripple current that would otherwise show up as loss further downstream. Beyond the raw efficiency numbers, the thing we were watching closest was whether the mode transitions actually held up under real conditions, and they did: stable bus regulation, MPPT that tracked correctly, and no dropouts moving between modes — all without a battery anywhere in the system.
 
