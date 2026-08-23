@@ -1,0 +1,26 @@
+# Bill of Materials
+
+| Component               | Value / Specification     | Function                                               |
+| ----------------------- | ------------------------- | ------------------------------------------------------ |
+| ESP32 Development Board | ESP32                     | Main controller, MPPT and energy management            |
+| IR2104                  | High/Low-Side Gate Driver | MOSFET gate driving                                    |
+| IRLZ44N MOSFET          | 55 V, 47 A                | Synchronous buck switching                             |
+| Schottky Diode          | SS34, 3 A, 40 V           | Freewheeling/protection                                |
+| Bootstrap Capacitor     | 100 nF                    | High-side gate-driver bootstrap                        |
+| Gate Resistor           | 10 Ω                      | Gate current limiting and switching control            |
+| Gate Pull-down Resistor | 100 kΩ                    | Keeps MOSFET OFF during startup                        |
+| Current/Power Sensor    | INA219                    | PV voltage and current measurement                     |
+| Supercapacitor          | 2.7 V, 100 F              | Energy storage and short-term energy buffering         |
+| Buck Converter Module   | XL4016                    | DC voltage regulation                                  |
+| Inductor                | 220uH                     | Energy storage and current smoothing in buck converter |
+| Input Capacitor         | 470uh                     | PV input filtering                                     |
+| Output Capacitor        | 470uh                     | Converter output filtering                             |
+| Voltage Divider         | 22k,10k,68k,100k          | Voltage sensing for ESP32                              |
+| Solar PV Panel          | 40w,21v                   | Renewable energy generation                            |
+| AC-DC Power Supply      | 12v,2A                    | AC-grid backup supply                                  |
+| DC Fuse                 | 5A                        | Over-current protection                                |
+| Terminal Block          |                           | Electrical power connections                           |
+| DC Switch               |  mosfets                  | System isolation and control                           |
+| PCB / Prototype Board   |                           | Circuit assembly                                       |
+| Connecting Wires        | 18awg,22awg               | Power and signal connections                           |
+| Heat Sink               |                           | MOSFET thermal management                              |

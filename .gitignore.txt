@@ -1,0 +1,28 @@
+# Arduino / ESP32
+*.hex
+*.elf
+*.eep
+
+# Build files
+build/
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Credentials
+secrets.h
+credentials.h
+
+# Python
+__pycache__/
+*.pyc
+
+# MATLAB temporary files
+*.asv
