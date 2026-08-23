@@ -44,19 +44,9 @@ What we wanted to test was whether that assumption holds up at the scale of a si
 
 ## How the system works
 
-<div align="center">
-
-
-<sub>Block diagram of the supercapacitor-assisted DC microgrid.</sub>
-</div>
 
 Solar power comes in through a synchronous buck converter, which does two things at once: it regulates the variable panel voltage into a stable DC bus, and it charges the supercapacitor bank. An ESP32 sits at the center of the whole system, reading photovoltaic voltage and current, supercapacitor voltage, bus voltage, and load current through a pair of INA219 sensors, and using those readings to decide — moment to moment, with no human involved — which of three operating modes the system should be in.
 
-<div align="center">
-
-
-<sub>The assembled prototype board, with the main functional blocks labeled.</sub>
-</div>
 
 ## Hardware
 
