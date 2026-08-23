@@ -23,7 +23,6 @@ Department of Physics and Electronics, Faculty of Science, University of Kelaniy
 - [Running the firmware](#running-the-firmware)
 - [Authors and supervision](#authors-and-supervision)
 - [Citing this work](#citing-this-work)
-- [License](#license)
 - [Thanks](#thanks)
 
 ---
@@ -120,9 +119,6 @@ This work was carried out by **J. S. Jenif** (EC/2021/050) and **Y. Thuvarakan**
 }
 ```
 
-## License
-
-Released under the [MIT License](LICENSE), unless noted otherwise.
 
 ## Thanks
 
