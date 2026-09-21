@@ -1,0 +1,1791 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include "esp_task_wdt.h"
+
+// ================================================================
+// SC DC MICROGRID 
+// BATTERY-LESS SUPERcapacitor DC MICROGRID
+// 2S BATTERY MONITORING - INDICATION 
+// ESP32 + Arduino C++
+// ================================================================
+
+// ---------------- PINS ----------------
+#define PIN_PWM       19
+#define PIN_SD        18
+#define PIN_SW1       23
+#define PIN_SW2       25
+#define PIN_RELAY     26
+#define PIN_SC_ADC    34
+#define PIN_LOAD_ADC  35
+#define PIN_RESET     27
+#define PIN_BAT1      32
+#define PIN_BATPACK   33
+#define I2C_SDA       21
+#define I2C_SCL       22
+
+// ---------------- PWM ----------------
+#define PWM_FREQ      40000UL
+#define PWM_BITS      8
+#define PWM_MAX       255
+#define DUTY_MIN_F    0.20f
+#define DUTY_MAX_F    0.85f
+#define MPPT_STEP     0.005f
+
+// ---------------- ADC DIVIDERS ----------------
+#define DIV_K_SC      5.70f
+#define DIV_K_LOAD    11.00f
+#define BAT_DIV_K     4.0308f
+#define OVS_SAMPLES   16
+
+// ---------------- CC-CV ----------------
+#define CHARGE_CURRENT_TARGET  1.50f
+#define CV_VOLTAGE_TARGET      13.00f
+#define CC_STEP                0.002f
+#define CV_STEP                0.001f
+
+// ---------------- SYSTEM LIMITS ----------------
+struct SystemLimits{
+  float ovp_enter,ovp_exit;
+  float uvp_enter,uvp_exit;
+  float abs_max;
+  float uvlo_margin,uvlo_hys;
+  float pv_ocp;
+  float load_ocp,load_rst;
+};
+
+const SystemLimits LIMITS={
+  .ovp_enter=13.70f,
+  .ovp_exit=12.50f,
+  .uvp_enter=9.00f,
+  .uvp_exit=10.50f,
+  .abs_max=15.00f,
+  .uvlo_margin=0.20f,
+  .uvlo_hys=1.00f,
+  .pv_ocp=2.60f,
+  .load_ocp=5.50f,
+  .load_rst=4.00f
+};
+
+// ---------------- INCREMENTAL CONDUCTANCE MPPT ----------------
+#define INC_TOL                0.015f
+#define DV_MIN                 0.020f
+#define DI_MIN                 0.005f
+#define PV_PRESENT_THRESHOLD   5.0f
+
+// ---------------- TIMING ----------------
+#define T_CONTROL              50UL
+#define T_LCD                  1500UL
+#define T_SERIAL               1000UL
+#define T_INA_CHECK            5000UL
+#define T_BATTERY              60000UL
+
+#define OCP_COOLDOWN_MS        5000UL
+#define SW2_OFF_DELAY_MS       50UL
+#define RELAY_ON_DELAY_MS      100UL
+#define RELAY_OFF_DELAY_MS     100UL
+#define SW2_ON_DELAY_MS        50UL
+#define TRANSITION_SAMPLES     5
+#define TRANSITION_TIMEOUT_MS  1000UL
+#define MIN_LOAD_VOLTAGE       8.0f
+
+#define WDT_TIMEOUT_S          10
+#define SPLASH_DELAY_MS        1500UL
+#define I2C_TIMEOUT_MS         10
+
+// ---------------- BATTERY ----------------
+#define BAT_LOW_PERCENT        20
+#define BAT_IMBALANCE_LIMIT    0.20f
+#define BAT_SAMPLES             20
+
+// ---------------- INA219 ----------------
+struct InaDev{
+  uint8_t addr;
+  uint16_t cal;
+  float curLsb;
+  float pwrLsb;
+  const char* tag;
+};
+
+InaDev ina1={0x40,4096,0.0001f,0.002f,"PV  "};
+InaDev ina2={0x41,4096,0.0002f,0.004f,"LOAD"};
+
+// ---------------- ENUMS ----------------
+enum SystemMode:uint8_t{
+  MODE_NORMAL=1,
+  MODE_OVP=2,
+  MODE_UVP=3,
+  MODE_FAULT=4
+};
+
+enum TransitionState:uint8_t{
+  TRANS_IDLE=0,
+  TRANS_TO_GRID_STEP1,
+  TRANS_TO_GRID_STEP2,
+  TRANS_TO_GRID_STEP3,
+  TRANS_TO_GRID_STEP4,
+  TRANS_TO_SC_STEP1,
+  TRANS_TO_SC_STEP2,
+  TRANS_TO_SC_STEP3,
+  TRANS_TO_SC_STEP4
+};
+
+// ---------------- LCD ----------------
+LiquidCrystal_I2C lcd(0x27,20,4);
+
+// ---------------- MAIN VARIABLES ----------------
+float V_pv=0,I_pv=0,P_pv=0;
+float V_load=0,I_load=0,P_load=0;
+float V_sc=0,duty_f=DUTY_MIN_F;
+float Vprev=0,Iprev=0;
+float loadVoltageDivider=0;
+float systemEfficiency=0;
+
+// ---------------- BATTERY VARIABLES ----------------
+float batCell1=0;
+float batCell2=0;
+float batPack=0;
+int bat1Percent=0;
+int bat2Percent=0;
+bool batteryLow=false;
+bool batteryImbalance=false;
+
+// ---------------- STATES ----------------
+SystemMode mode=MODE_NORMAL;
+SystemMode prevMode=MODE_NORMAL;
+TransitionState transState=TRANS_IDLE;
+
+bool load_ocp=false;
+bool mppt_active=false;
+bool uvlo_active=false;
+bool ssActive=false;
+bool ina1Ok=false;
+bool ina2Ok=false;
+bool fault_latched=false;
+bool splashComplete=false;
+
+uint8_t pv_ocp_cnt=0;
+uint8_t sensor_err_cnt=0;
+uint8_t transitionSampleCount=0;
+
+uint16_t fault_code=0;
+
+char fault_reason[24]="";
+
+uint32_t ssTarget=0;
+
+unsigned long ssLast=0;
+unsigned long t_control=0;
+unsigned long t_lcd=0;
+unsigned long t_ser=0;
+unsigned long t_ina=0;
+unsigned long t_battery=0;
+
+unsigned long load_ocp_trip_time=0;
+unsigned long transitionStartTime=0;
+unsigned long transitionStepTime=0;
+unsigned long splashStartTime=0;
+
+char lcd_line1[21]="";
+char lcd_line2[21]="";
+char lcd_line3[21]="";
+char lcd_line4[21]="";
+
+bool transitionSampleDone=false;
+
+// ================================================================
+// INA219 DRIVER
+// ================================================================
+
+void inaWrite(uint8_t a,uint8_t r,uint16_t v){
+  Wire.beginTransmission(a);
+  Wire.write(r);
+  Wire.write((uint8_t)(v>>8));
+  Wire.write((uint8_t)(v&0xFF));
+  Wire.endTransmission();
+}
+
+uint16_t inaRead(uint8_t a,uint8_t r){
+  Wire.beginTransmission(a);
+  Wire.write(r);
+  if(Wire.endTransmission(false)!=0)return 0;
+  Wire.requestFrom(a,(uint8_t)2);
+  if(Wire.available()<2)return 0;
+  uint16_t v=(uint16_t)Wire.read()<<8;
+  v|=Wire.read();
+  return v;
+}
+
+bool inaInit(InaDev &d){
+  Wire.beginTransmission(d.addr);
+  if(Wire.endTransmission()!=0){
+    Serial.printf("[INA-%s] NOT FOUND\n",d.tag);
+    return false;
+  }
+
+  inaWrite(d.addr,0x00,0x8000);
+  delay(10);
+  inaWrite(d.addr,0x00,0x3FFF);
+  inaWrite(d.addr,0x05,d.cal);
+
+  if(inaRead(d.addr,0x05)!=d.cal){
+    Serial.printf("[INA-%s] CAL FAIL\n",d.tag);
+    return false;
+  }
+
+  Serial.printf("[INA-%s] 0x%02X OK CAL=%u\n",
+                d.tag,d.addr,d.cal);
+  return true;
+}
+
+bool inaCheck(InaDev &d){
+  return (inaRead(d.addr,0x00)==0x3FFF)||inaInit(d);
+}
+
+float inaVoltage(uint8_t a){
+  return (float)(inaRead(a,0x02)>>3)*0.004f;
+}
+
+float inaCurrent(InaDev &d){
+  float i=(float)(int16_t)inaRead(d.addr,0x04)*d.curLsb;
+  return i<0?0:i;
+}
+
+float inaPower(InaDev &d){
+  return (float)inaRead(d.addr,0x03)*d.pwrLsb;
+}
+
+// ================================================================
+// VOLTAGE MEASUREMENTS
+// ================================================================
+
+float readSCVoltage(){
+  uint32_t s=0;
+
+  for(int i=0;i<OVS_SAMPLES;i++){
+    s+=analogReadMilliVolts(PIN_SC_ADC);
+    delayMicroseconds(100);
+  }
+
+  float adcV=(float)s/(float)OVS_SAMPLES/1000.0f;
+  float rawV=adcV*DIV_K_SC;
+
+  static float ema=0;
+
+  if(ema==0)ema=rawV;
+  else ema=0.85f*ema+0.15f*rawV;
+
+  return ema;
+}
+
+float readLoadVoltage(){
+  uint32_t s=0;
+
+  for(int i=0;i<OVS_SAMPLES;i++){
+    s+=analogReadMilliVolts(PIN_LOAD_ADC);
+    delayMicroseconds(100);
+  }
+
+  float adcV=(float)s/(float)OVS_SAMPLES/1000.0f;
+  float rawV=adcV*DIV_K_LOAD;
+
+  static float ema=0;
+
+  if(ema==0)ema=rawV;
+  else ema=0.85f*ema+0.15f*rawV;
+
+  return ema;
+}
+
+// ================================================================
+// BATTERY VOLTAGE
+// GPIO32 = CELL 1
+// GPIO33 = TOTAL 2S PACK
+// CELL 2 = PACK - CELL 1
+// ================================================================
+
+float readBatteryADC(uint8_t pin){
+  uint32_t sum=0;
+
+  for(int i=0;i<BAT_SAMPLES;i++){
+    sum+=analogReadMilliVolts(pin);
+    delayMicroseconds(100);
+  }
+
+  float adcV=(float)sum/(float)BAT_SAMPLES/1000.0f;
+  return adcV*BAT_DIV_K;
+}
+
+int batteryPercent(float v){
+  const float V[]={3.00f,3.30f,3.50f,3.60f,3.70f,
+                   3.80f,3.90f,4.00f,4.10f,4.20f};
+
+  const int P[]={0,5,10,20,40,55,70,82,92,100};
+
+  if(v<=V[0])return 0;
+  if(v>=V[9])return 100;
+
+  for(int i=0;i<9;i++){
+    if(v>=V[i]&&v<V[i+1]){
+      float ratio=(v-V[i])/(V[i+1]-V[i]);
+      return (int)(P[i]+ratio*(P[i+1]-P[i]));
+    }
+  }
+
+  return 0;
+}
+
+void updateBattery(){
+  batCell1=readBatteryADC(PIN_BAT1);
+  batPack=readBatteryADC(PIN_BATPACK);
+
+  batCell2=batPack-batCell1;
+
+  if(batCell1<0)batCell1=0;
+  if(batCell2<0)batCell2=0;
+
+  bat1Percent=batteryPercent(batCell1);
+  bat2Percent=batteryPercent(batCell2);
+
+  batteryLow=(bat1Percent<=BAT_LOW_PERCENT||
+              bat2Percent<=BAT_LOW_PERCENT);
+
+  batteryImbalance=(fabsf(batCell1-batCell2)>=BAT_IMBALANCE_LIMIT);
+
+  Serial.printf("[BAT] B1=%.2fV %d%% | B2=%.2fV %d%% | PACK=%.2fV",
+                batCell1,bat1Percent,
+                batCell2,bat2Percent,
+                batPack);
+
+  if(batteryLow)Serial.print(" | LOW");
+  if(batteryImbalance)Serial.print(" | IMBALANCE");
+
+  Serial.println();
+}
+
+// ================================================================
+// ACTUATORS
+// ================================================================
+
+void applyDuty(float d){
+  duty_f=constrain(d,DUTY_MIN_F,DUTY_MAX_F);
+  uint8_t pwm=(uint8_t)(duty_f*(float)PWM_MAX);
+  ledcWrite(PIN_PWM,pwm);
+}
+
+void disableBuck(){
+  ledcWrite(PIN_PWM,0);
+  digitalWrite(PIN_SD,LOW);
+  mppt_active=false;
+}
+
+void enableBuck(){
+  digitalWrite(PIN_SD,HIGH);
+  mppt_active=true;
+}
+
+void setSW1(bool on){
+  digitalWrite(PIN_SW1,on?HIGH:LOW);
+}
+
+void setSW2(bool on){
+  digitalWrite(PIN_SW2,on?HIGH:LOW);
+}
+
+void setRelay(bool on){
+  digitalWrite(PIN_RELAY,on?HIGH:LOW);
+}
+
+// ================================================================
+// FAULT HANDLING
+// ================================================================
+
+void enterFault(uint16_t code,const char* msg){
+  if(fault_latched)return;
+
+  disableBuck();
+  applyDuty(DUTY_MIN_F);
+
+  setSW1(false);
+  setSW2(false);
+  setRelay(false);
+
+  mode=MODE_FAULT;
+  fault_latched=true;
+  fault_code=code;
+
+  strncpy(fault_reason,msg,sizeof(fault_reason)-1);
+  fault_reason[sizeof(fault_reason)-1]='\0';
+
+  Serial.printf("\n!!! FAULT %04d: %s\n",code,msg);
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("FAULT");
+  lcd.setCursor(0,1);
+  lcd.print(msg);
+}
+
+void resetFault(){
+  if(!fault_latched)return;
+
+  fault_latched=false;
+  fault_code=0;
+  fault_reason[0]='\0';
+
+  mode=MODE_NORMAL;
+  prevMode=MODE_NORMAL;
+
+  transState=TRANS_IDLE;
+  transitionSampleCount=0;
+  transitionSampleDone=false;
+
+  sensor_err_cnt=0;
+  pv_ocp_cnt=0;
+  ssActive=false;
+  load_ocp=false;
+
+  duty_f=DUTY_MIN_F;
+  Vprev=0;
+  Iprev=0;
+
+  ina1Ok=inaInit(ina1);
+  ina2Ok=inaInit(ina2);
+
+  Serial.println("\n*** FAULT RESET ***");
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Reset OK");
+  lcd.setCursor(0,1);
+  lcd.print("Restarting...");
+
+  delay(500);
+}
+
+// ================================================================
+// BASIC STATUS
+// ================================================================
+
+bool isLoadPhysicallyOff(){
+  return(loadVoltageDivider<2.0f&&I_load<0.05f);
+}
+
+bool pvPresent(){
+  return(V_pv>PV_PRESENT_THRESHOLD);
+}
+
+// ================================================================
+// TRANSITION TO GRID
+// ================================================================
+
+void startTransitionToGrid(){
+  Serial.println("-> Transition to Grid");
+
+  disableBuck();
+
+  transState=TRANS_TO_GRID_STEP1;
+  transitionStartTime=millis();
+  transitionStepTime=transitionStartTime;
+
+  transitionSampleCount=0;
+  transitionSampleDone=false;
+
+  setSW2(false);
+}
+
+void startTransitionToSC(){
+  Serial.println("-> Transition to SC");
+
+  disableBuck();
+
+  transState=TRANS_TO_SC_STEP1;
+  transitionStartTime=millis();
+  transitionStepTime=transitionStartTime;
+
+  transitionSampleCount=0;
+  transitionSampleDone=false;
+
+  setRelay(false);
+}
+
+// ================================================================
+// TRANSITION FSM
+// ================================================================
+
+void processTransition(){
+  if(transState==TRANS_IDLE)return;
+
+  unsigned long now=millis();
+
+  if(now-transitionStartTime>TRANSITION_TIMEOUT_MS){
+    enterFault(11,"Transition timeout");
+    transState=TRANS_IDLE;
+    return;
+  }
+
+  switch(transState){
+
+    case TRANS_TO_GRID_STEP1:
+      if(now-transitionStepTime>=SW2_OFF_DELAY_MS){
+        transState=TRANS_TO_GRID_STEP2;
+        transitionStepTime=now;
+        transitionSampleCount=0;
+        transitionSampleDone=false;
+        Serial.println("SW2 OFF -> isolation check");
+      }
+      break;
+
+    case TRANS_TO_GRID_STEP2:
+      if(!transitionSampleDone){
+        if(transitionSampleCount<TRANSITION_SAMPLES){
+
+          if(!isLoadPhysicallyOff()){
+            Serial.println("Load bus not fully discharged");
+          }
+
+          transitionSampleCount++;
+          transitionStepTime=now;
+          return;
+        }
+
+        transitionSampleDone=true;
+        transitionStepTime=now;
+
+        setRelay(true);
+        Serial.println("Relay ON");
+
+        transState=TRANS_TO_GRID_STEP3;
+        transitionStepTime=now;
+      }
+      break;
+
+    case TRANS_TO_GRID_STEP3:
+      if(now-transitionStepTime>=RELAY_ON_DELAY_MS){
+        transState=TRANS_TO_GRID_STEP4;
+        transitionStepTime=now;
+        Serial.println("Verifying Grid");
+      }
+      break;
+
+    case TRANS_TO_GRID_STEP4:
+      if(now-transitionStepTime>=10){
+
+        readSensors();
+
+        if(digitalRead(PIN_RELAY)==HIGH&&
+           loadVoltageDivider>MIN_LOAD_VOLTAGE&&
+           V_load>MIN_LOAD_VOLTAGE){
+
+          Serial.printf("Grid OK Vdiv=%.2fV VINA=%.2fV\n",
+                        loadVoltageDivider,V_load);
+
+          transState=TRANS_IDLE;
+          mode=MODE_UVP;
+
+          Serial.println("[FSM] -> GRID");
+        }
+        else{
+          enterFault(6,"Relay failed");
+          transState=TRANS_IDLE;
+        }
+      }
+      break;
+
+    case TRANS_TO_SC_STEP1:
+      if(now-transitionStepTime>=RELAY_OFF_DELAY_MS){
+
+        transState=TRANS_TO_SC_STEP2;
+        transitionStepTime=now;
+
+        transitionSampleCount=0;
+        transitionSampleDone=false;
+
+        Serial.println("Relay OFF -> isolation check");
+      }
+      break;
+
+    case TRANS_TO_SC_STEP2:
+      if(!transitionSampleDone){
+
+        if(transitionSampleCount<TRANSITION_SAMPLES){
+
+          if(!isLoadPhysicallyOff()){
+            Serial.println("Load not off - retry");
+          }
+
+          transitionSampleCount++;
+          transitionStepTime=now;
+          return;
+        }
+
+        transitionSampleDone=true;
+
+        setSW2(true);
+
+        Serial.println("SW2 ON");
+
+        transState=TRANS_TO_SC_STEP3;
+        transitionStepTime=now;
+      }
+      break;
+
+    case TRANS_TO_SC_STEP3:
+      if(now-transitionStepTime>=SW2_ON_DELAY_MS){
+
+        transState=TRANS_TO_SC_STEP4;
+        transitionStepTime=now;
+
+        Serial.println("Verifying SC connection");
+      }
+      break;
+
+    case TRANS_TO_SC_STEP4:
+      if(now-transitionStepTime>=10){
+
+        readSensors();
+
+        if(loadVoltageDivider>MIN_LOAD_VOLTAGE&&
+           V_load>MIN_LOAD_VOLTAGE){
+
+          Serial.printf("SC OK Vdiv=%.2fV VINA=%.2fV\n",
+                        loadVoltageDivider,V_load);
+
+          transState=TRANS_IDLE;
+          mode=MODE_NORMAL;
+
+          Serial.println("[FSM] -> NORMAL");
+        }
+        else{
+
+          if(loadVoltageDivider<0.5f&&V_load<0.5f){
+            enterFault(8,"SC failed");
+          }
+
+          transState=TRANS_IDLE;
+        }
+      }
+      break;
+
+    default:
+      transState=TRANS_IDLE;
+      break;
+  }
+}
+
+// ================================================================
+// SOFT START
+// ================================================================
+
+void beginSoftStart(float vpv){
+  if(vpv<2.0f)return;
+
+  ssActive=true;
+
+  applyDuty(DUTY_MIN_F);
+  enableBuck();
+
+  ssTarget=(uint32_t)(
+    (float)PWM_MAX*
+    constrain(V_sc/vpv,DUTY_MIN_F,DUTY_MAX_F)
+  );
+
+  ssLast=millis();
+}
+
+void beginMatchedRestart(float vpv,float vsc){
+  if(vpv<2.0f)return;
+
+  setSW1(true);
+
+  float d=constrain(vsc/vpv,DUTY_MIN_F,DUTY_MAX_F);
+
+  applyDuty(d);
+  enableBuck();
+
+  Vprev=vpv;
+  Iprev=I_pv;
+
+  Serial.printf("[RESTART] Vsc=%.2f Vpv=%.2f D=%.1f%%\n",
+                vsc,vpv,d*100.0f);
+}
+
+void serviceSoftStart(float Ipv){
+  if(!ssActive)return;
+
+  if(Ipv>LIMITS.pv_ocp){
+    enterFault(9,"OCP:softstart");
+    return;
+  }
+
+  if(millis()-ssLast<6UL)return;
+
+  ssLast=millis();
+
+  uint32_t current=(uint32_t)(
+    duty_f*(float)PWM_MAX
+  );
+
+  if(current<ssTarget){
+
+    applyDuty(
+      (float)(current+1)/(float)PWM_MAX
+    );
+
+  }else{
+
+    ssActive=false;
+
+    Vprev=V_pv;
+    Iprev=I_pv;
+
+    Serial.println("Soft-start complete");
+  }
+}
+
+// ================================================================
+// UVP CC-CV CONTROL
+// ================================================================
+
+void uvpChargeControl(){
+
+  if(V_pv<=V_sc+LIMITS.uvlo_margin){
+
+    uvlo_active=true;
+
+  }else if(V_pv>=
+           V_sc+
+           LIMITS.uvlo_margin+
+           LIMITS.uvlo_hys){
+
+    uvlo_active=false;
+  }
+
+  if(uvlo_active){
+
+    if(mppt_active)disableBuck();
+    return;
+  }
+
+  if(!mppt_active){
+
+    beginSoftStart(V_pv);
+    return;
+  }
+
+  if(ssActive)return;
+
+  if(I_pv>LIMITS.pv_ocp){
+
+    duty_f-=0.020f;
+    applyDuty(duty_f);
+    return;
+  }
+
+  if(V_sc<CV_VOLTAGE_TARGET){
+
+    if(I_pv<CHARGE_CURRENT_TARGET)
+      duty_f+=CC_STEP;
+
+    else if(I_pv>CHARGE_CURRENT_TARGET)
+      duty_f-=CC_STEP;
+
+  }else{
+
+    if(V_sc>CV_VOLTAGE_TARGET)
+      duty_f-=CV_STEP;
+
+    else if(V_sc<CV_VOLTAGE_TARGET-0.1f)
+      duty_f+=CV_STEP;
+  }
+
+  duty_f=constrain(
+    duty_f,
+    DUTY_MIN_F,
+    DUTY_MAX_F
+  );
+
+  applyDuty(duty_f);
+}
+
+// ================================================================
+// INCREMENTAL CONDUCTANCE MPPT
+// ================================================================
+
+void InCond_MPPT(){
+
+  if(!pvPresent()){
+
+    if(mppt_active)
+      disableBuck();
+
+    return;
+  }
+
+  if(V_pv<=V_sc+LIMITS.uvlo_margin){
+
+    uvlo_active=true;
+
+  }else if(V_pv>=
+           V_sc+
+           LIMITS.uvlo_margin+
+           LIMITS.uvlo_hys){
+
+    uvlo_active=false;
+  }
+
+  if(uvlo_active){
+
+    if(mppt_active)
+      disableBuck();
+
+    Vprev=V_pv;
+    Iprev=I_pv;
+
+    return;
+  }
+
+  if(!mppt_active){
+
+    beginSoftStart(V_pv);
+    return;
+  }
+
+  if(ssActive)return;
+
+  if(I_pv>LIMITS.pv_ocp){
+
+    duty_f-=0.020f;
+    applyDuty(duty_f);
+
+    Vprev=V_pv;
+    Iprev=I_pv;
+
+    return;
+  }
+
+  float dV=V_pv-Vprev;
+  float dI=I_pv-Iprev;
+
+  float tol=
+    INC_TOL*V_pv*fabsf(I_pv)+0.001f;
+
+  bool atMPP=false;
+
+  if(fabsf(dV)<DV_MIN){
+
+    if(fabsf(dI)<DI_MIN){
+
+      atMPP=true;
+
+    }else if(dI>0){
+
+      duty_f-=MPPT_STEP;
+
+    }else{
+
+      duty_f+=MPPT_STEP;
+    }
+
+  }else{
+
+    float c=
+      dI/dV+
+      I_pv/fmaxf(V_pv,0.5f);
+
+    if(fabsf(c)<=tol){
+
+      atMPP=true;
+
+    }else if(c>tol){
+
+      duty_f-=MPPT_STEP;
+
+    }else{
+
+      duty_f+=MPPT_STEP;
+    }
+  }
+
+  if(!atMPP)
+    applyDuty(duty_f);
+
+  Vprev=V_pv;
+  Iprev=I_pv;
+}
+
+// ================================================================
+// EFFICIENCY
+// ================================================================
+
+void calculateEfficiency(){
+
+  if(P_pv>0.5f){
+
+    systemEfficiency=
+      constrain(
+        (P_load/P_pv)*100.0f,
+        0.0f,
+        100.0f
+      );
+
+  }else{
+
+    systemEfficiency=0.0f;
+  }
+}
+
+// ================================================================
+// MAIN SYSTEM FSM
+// ================================================================
+
+void updateFSM(){
+
+  if(fault_latched)return;
+
+  if(V_sc>=LIMITS.abs_max){
+
+    enterFault(1,"SC ABS OVP");
+    return;
+  }
+
+  if(sensor_err_cnt>5){
+
+    enterFault(2,"I2C error");
+    return;
+  }
+
+  if(!ina1Ok||!ina2Ok){
+
+    enterFault(3,"INA219 lost");
+    return;
+  }
+
+  processTransition();
+
+  if(transState!=TRANS_IDLE)return;
+
+  prevMode=mode;
+
+  if(mode==MODE_NORMAL&&
+     V_sc>=LIMITS.ovp_enter){
+
+    mode=MODE_OVP;
+
+  }else if(mode==MODE_OVP&&
+           V_sc<=LIMITS.ovp_exit){
+
+    mode=MODE_NORMAL;
+
+  }else if(mode==MODE_NORMAL&&
+           V_sc<=LIMITS.uvp_enter){
+
+    startTransitionToGrid();
+    return;
+
+  }else if(mode==MODE_UVP&&
+           V_sc>=LIMITS.uvp_exit){
+
+    startTransitionToSC();
+    return;
+  }
+
+  if(mode!=prevMode){
+
+    Serial.printf(
+      "[FSM] %d -> %d Vsc=%.2fV\n",
+      prevMode,mode,V_sc
+    );
+
+    switch(mode){
+
+      case MODE_OVP:
+
+        setSW1(false);
+        disableBuck();
+        ssActive=false;
+        setRelay(false);
+
+        break;
+
+      case MODE_NORMAL:
+
+        if(prevMode==MODE_OVP){
+
+          setSW2(true);
+          setRelay(false);
+
+          beginMatchedRestart(
+            V_pv,
+            V_sc
+          );
+        }
+
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  if(fault_latched)return;
+
+  switch(mode){
+
+    case MODE_NORMAL:
+
+      if(!digitalRead(PIN_SW1))
+        setSW1(true);
+
+      if(!digitalRead(PIN_SW2))
+        setSW2(true);
+
+      if(digitalRead(PIN_RELAY)==HIGH)
+        setRelay(false);
+
+      if(!load_ocp&&pvPresent())
+        InCond_MPPT();
+
+      else if(!pvPresent())
+        disableBuck();
+
+      calculateEfficiency();
+
+      break;
+
+    case MODE_OVP:
+
+      if(digitalRead(PIN_SW1))
+        setSW1(false);
+
+      if(!digitalRead(PIN_SW2))
+        setSW2(true);
+
+      if(digitalRead(PIN_RELAY)==HIGH)
+        setRelay(false);
+
+      if(mppt_active)
+        disableBuck();
+
+      calculateEfficiency();
+
+      break;
+
+    case MODE_UVP:
+
+      if(digitalRead(PIN_SW2))
+        setSW2(false);
+
+      if(!digitalRead(PIN_SW1))
+        setSW1(true);
+
+      if(digitalRead(PIN_RELAY)==LOW)
+        setRelay(true);
+
+      if(pvPresent())
+        uvpChargeControl();
+
+      else
+        disableBuck();
+
+      calculateEfficiency();
+
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ================================================================
+// PROTECTION
+// ================================================================
+
+void checkProtections(){
+
+  if(fault_latched)return;
+
+  if(I_pv>LIMITS.pv_ocp&&mppt_active){
+
+    duty_f-=0.020f;
+    applyDuty(duty_f);
+
+    pv_ocp_cnt++;
+
+    if(pv_ocp_cnt>10){
+
+      enterFault(10,"PV OCP");
+      return;
+    }
+
+  }else{
+
+    pv_ocp_cnt=0;
+  }
+
+  if(I_load>LIMITS.load_ocp&&!load_ocp){
+
+    setSW2(false);
+
+    load_ocp=true;
+    load_ocp_trip_time=millis();
+
+    Serial.printf(
+      "Load OCP tripped %.3fA\n",
+      I_load
+    );
+
+  }else if(
+    load_ocp&&
+    millis()-load_ocp_trip_time>OCP_COOLDOWN_MS&&
+    mode!=MODE_UVP&&
+    mode!=MODE_FAULT&&
+    !fault_latched
+  ){
+
+    if(I_load<LIMITS.load_rst){
+
+      setSW2(true);
+      load_ocp=false;
+
+      Serial.println("Load OCP cleared");
+
+    }else{
+
+      Serial.printf(
+        "Load OCP still high %.3fA\n",
+        I_load
+      );
+    }
+  }
+}
+
+// ================================================================
+// SENSOR READ
+// ================================================================
+
+bool readSensors(){
+
+  float v1=inaVoltage(ina1.addr);
+
+  if(v1<0||v1>30){
+
+    sensor_err_cnt++;
+    return false;
+  }
+
+  V_pv=v1;
+  I_pv=inaCurrent(ina1);
+  P_pv=inaPower(ina1);
+
+  float v2=inaVoltage(ina2.addr);
+
+  if(v2<0||v2>30){
+
+    sensor_err_cnt++;
+    return false;
+  }
+
+  V_load=v2;
+  I_load=inaCurrent(ina2);
+  P_load=inaPower(ina2);
+
+  V_sc=readSCVoltage();
+  loadVoltageDivider=readLoadVoltage();
+
+  sensor_err_cnt=0;
+
+  return true;
+}
+
+// ================================================================
+// LCD
+// ================================================================
+
+void updateLCD(){
+
+  char line1[21];
+  char line2[21];
+  char line3[21];
+  char line4[21];
+
+  if(mode==MODE_FAULT){
+
+    snprintf(
+      line1,21,
+      "FAULT %04d",
+      fault_code
+    );
+
+    snprintf(
+      line2,21,
+      "%-20s",
+      fault_reason
+    );
+
+    snprintf(
+      line3,21,
+      "B1 %4.2fV %3d%%",
+      batCell1,
+      bat1Percent
+    );
+
+    snprintf(
+      line4,21,
+      "B2 %4.2fV %3d%%",
+      batCell2,
+      bat2Percent
+    );
+
+  }else{
+
+    const char* modeStr=
+      (mode==MODE_NORMAL)?"NORMAL":
+      (mode==MODE_OVP)?"OVP":
+      (mode==MODE_UVP)?"GRID":"FAULT";
+
+    snprintf(
+      line1,21,
+      "%-7s D:%5.1f%%",
+      modeStr,
+      duty_f*100.0f
+    );
+
+    snprintf(
+      line2,21,
+      "SC:%5.2f PV:%5.2f",
+      V_sc,
+      V_pv
+    );
+
+    snprintf(
+      line3,21,
+      "B1:%3d B2:%3d",
+      bat1Percent,
+      bat2Percent
+    );
+
+    if(batteryLow){
+
+      snprintf(
+        line4,21,
+        "LOW BATTERY!"
+      );
+
+    }else if(batteryImbalance){
+
+      snprintf(
+        line4,21,
+        "BAT IMBALANCE!"
+      );
+
+    }else{
+
+      snprintf(
+        line4,21,
+        "LOAD:%5.2fV %4.1fW",
+        V_load,
+        P_load
+      );
+    }
+  }
+
+  if(strcmp(lcd_line1,line1)!=0){
+
+    strcpy(lcd_line1,line1);
+    lcd.setCursor(0,0);
+    lcd.print("                    ");
+    lcd.setCursor(0,0);
+    lcd.print(line1);
+  }
+
+  if(strcmp(lcd_line2,line2)!=0){
+
+    strcpy(lcd_line2,line2);
+    lcd.setCursor(0,1);
+    lcd.print("                    ");
+    lcd.setCursor(0,1);
+    lcd.print(line2);
+  }
+
+  if(strcmp(lcd_line3,line3)!=0){
+
+    strcpy(lcd_line3,line3);
+    lcd.setCursor(0,2);
+    lcd.print("                    ");
+    lcd.setCursor(0,2);
+    lcd.print(line3);
+  }
+
+  if(strcmp(lcd_line4,line4)!=0){
+
+    strcpy(lcd_line4,line4);
+    lcd.setCursor(0,3);
+    lcd.print("                    ");
+    lcd.setCursor(0,3);
+    lcd.print(line4);
+  }
+}
+
+// ================================================================
+// SERIAL TELEMETRY
+// ================================================================
+
+void printSerial(){
+
+  if(fault_latched){
+
+    Serial.println("==================================================");
+    Serial.printf(
+      "!!! FAULT %04d: %s\n",
+      fault_code,
+      fault_reason
+    );
+    Serial.println("Type r to reset, s for status");
+    Serial.println("==================================================");
+
+    return;
+  }
+
+  const char* ms=
+    (mode==MODE_NORMAL)?"NORMAL":
+    (mode==MODE_OVP)?"OVP":
+    (mode==MODE_UVP)?"GRID":"FAULT";
+
+  Serial.println("==================================================");
+
+  Serial.printf(
+    "MODE:%s SW1:%d SW2:%d SD:%d RLY:%d MPPT:%s D:%.1f%%\n",
+    ms,
+    digitalRead(PIN_SW1),
+    digitalRead(PIN_SW2),
+    digitalRead(PIN_SD),
+    digitalRead(PIN_RELAY),
+    mppt_active?"ON":"OFF",
+    duty_f*100.0f
+  );
+
+  Serial.printf(
+    "Vpv=%.3fV Ipv=%.4fA Pin=%.3fW\n",
+    V_pv,I_pv,P_pv
+  );
+
+  Serial.printf(
+    "Vsc=%.3fV\n",
+    V_sc
+  );
+
+  Serial.printf(
+    "Vload=%.3fV Iload=%.4fA Pload=%.3fW\n",
+    V_load,I_load,P_load
+  );
+
+  Serial.printf(
+    "Efficiency=%.1f%%\n",
+    systemEfficiency
+  );
+
+  Serial.printf(
+    "UVLO:%s PV:%s INA1:%d INA2:%d\n",
+    uvlo_active?"YES":"NO",
+    pvPresent()?"YES":"NO",
+    ina1Ok,
+    ina2Ok
+  );
+
+  Serial.printf(
+    "Battery B1=%.2fV %d%% B2=%.2fV %d%% Pack=%.2fV\n",
+    batCell1,
+    bat1Percent,
+    batCell2,
+    bat2Percent,
+    batPack
+  );
+
+  Serial.printf(
+    "Battery Low:%s Imbalance:%s\n",
+    batteryLow?"YES":"NO",
+    batteryImbalance?"YES":"NO"
+  );
+
+  Serial.printf(
+    "CC Target=%.2fA CV Target=%.2fV\n",
+    CHARGE_CURRENT_TARGET,
+    CV_VOLTAGE_TARGET
+  );
+
+  Serial.println("==================================================");
+}
+
+// ================================================================
+// RESET INPUT
+// ================================================================
+
+void handleResetInputs(){
+
+  if(Serial.available()){
+
+    char c=Serial.read();
+
+    if(c=='r'||c=='R')
+      resetFault();
+
+    else if(c=='s'||c=='S')
+      printSerial();
+  }
+
+  if(
+    digitalRead(PIN_RESET)==LOW&&
+    fault_latched
+  ){
+
+    delay(50);
+
+    if(digitalRead(PIN_RESET)==LOW){
+
+      resetFault();
+
+      while(digitalRead(PIN_RESET)==LOW)
+        delay(10);
+    }
+  }
+}
+
+// ================================================================
+// SPLASH SCREEN
+// ================================================================
+
+void showSplashScreen(){
+
+  if(!splashComplete){
+
+    if(splashStartTime==0){
+
+      splashStartTime=millis();
+
+      lcd.clear();
+
+      lcd.setCursor(0,0);
+      lcd.print("SC Grid v5.26");
+
+      lcd.setCursor(0,1);
+      lcd.print("MPPT + CC-CV");
+
+      lcd.setCursor(0,2);
+      lcd.print("2S Battery Monitor");
+    }
+
+    if(millis()-splashStartTime>=SPLASH_DELAY_MS){
+
+      splashComplete=true;
+      lcd.clear();
+    }
+  }
+}
+
+// ================================================================
+// SETUP
+// ================================================================
+
+void setup(){
+
+  Serial.begin(115200);
+  delay(400);
+
+  Serial.println();
+  Serial.println("==================================================");
+  Serial.println(" SC DC MICROGRID v5.26");
+  Serial.println(" 50W SUPERcapacitor DC MICROGRID");
+  Serial.println(" 2S BATTERY MONITORING");
+  Serial.println("==================================================");
+
+  // ---------------- GPIO ----------------
+
+  pinMode(PIN_SD,OUTPUT);
+  digitalWrite(PIN_SD,LOW);
+
+  pinMode(PIN_SW1,OUTPUT);
+  digitalWrite(PIN_SW1,LOW);
+
+  pinMode(PIN_SW2,OUTPUT);
+  digitalWrite(PIN_SW2,LOW);
+
+  pinMode(PIN_RELAY,OUTPUT);
+  digitalWrite(PIN_RELAY,LOW);
+
+  pinMode(PIN_RESET,INPUT_PULLUP);
+
+  pinMode(PIN_BAT1,INPUT);
+  pinMode(PIN_BATPACK,INPUT);
+
+  // ---------------- PWM ----------------
+
+  ledcAttach(
+    PIN_PWM,
+    PWM_FREQ,
+    PWM_BITS
+  );
+
+  ledcWrite(
+    PIN_PWM,
+    0
+  );
+
+  Serial.println("[OK] PWM 40kHz");
+
+  // ---------------- ADC ----------------
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  Serial.println("[OK] ADC");
+
+  // ---------------- I2C ----------------
+
+  Wire.begin(
+    I2C_SDA,
+    I2C_SCL
+  );
+
+  Wire.setClock(400000);
+  Wire.setTimeout(I2C_TIMEOUT_MS);
+
+  Serial.println("[OK] I2C 400kHz");
+
+  // ---------------- LCD ----------------
+
+  lcd.init();
+  lcd.backlight();
+
+  // ---------------- INA219 ----------------
+
+  ina1Ok=inaInit(ina1);
+  ina2Ok=inaInit(ina2);
+
+  if(!ina1Ok||!ina2Ok){
+
+    lcd.clear();
+
+    lcd.setCursor(0,0);
+    lcd.print("INA219 MISSING!");
+
+    Serial.println("FATAL: INA219 missing");
+
+    while(1){
+
+      esp_task_wdt_reset();
+      delay(500);
+    }
+  }
+
+  Serial.println("[OK] INA219 x2");
+
+  // ---------------- WATCHDOG ----------------
+
+  esp_task_wdt_deinit();
+
+  esp_task_wdt_config_t wdt={
+    .timeout_ms=(uint32_t)(WDT_TIMEOUT_S*1000),
+    .idle_core_mask=0,
+    .trigger_panic=true
+  };
+
+  esp_task_wdt_init(&wdt);
+  esp_task_wdt_add(NULL);
+
+  Serial.println("[OK] Watchdog");
+
+  // ---------------- SENSOR PRIME ----------------
+
+  for(int i=0;i<20;i++){
+
+    readSCVoltage();
+    delay(10);
+  }
+
+  readSensors();
+  updateBattery();
+
+  Serial.printf(
+    "[BOOT] Vsc=%.2fV Vpv=%.2fV Vload=%.2fV\n",
+    V_sc,
+    V_pv,
+    loadVoltageDivider
+  );
+
+  // ---------------- INITIAL MODE ----------------
+
+  if(V_sc>=LIMITS.ovp_enter)
+    mode=MODE_OVP;
+
+  else if(V_sc<=LIMITS.uvp_enter)
+    mode=MODE_UVP;
+
+  else
+    mode=MODE_NORMAL;
+
+  prevMode=mode;
+
+  // ---------------- INITIAL STATE ----------------
+
+  switch(mode){
+
+    case MODE_NORMAL:
+
+      setSW1(true);
+      setSW2(true);
+      setRelay(false);
+
+      if(pvPresent()){
+
+        applyDuty(DUTY_MIN_F);
+        beginSoftStart(V_pv);
+
+      }else{
+
+        disableBuck();
+      }
+
+      Vprev=V_pv;
+      Iprev=I_pv;
+
+      break;
+
+    case MODE_OVP:
+
+      setSW1(false);
+      setSW2(true);
+      setRelay(false);
+
+      disableBuck();
+
+      break;
+
+    case MODE_UVP:
+
+      setSW2(false);
+      setRelay(true);
+      setSW1(true);
+
+      if(pvPresent()){
+
+        applyDuty(DUTY_MIN_F);
+        beginSoftStart(V_pv);
+
+      }else{
+
+        disableBuck();
+      }
+
+      break;
+
+    default:
+      break;
+  }
+
+  splashStartTime=0;
+  splashComplete=false;
+
+  unsigned long now=millis();
+
+  t_control=now;
+  t_lcd=now;
+  t_ser=now;
+  t_ina=now;
+  t_battery=now;
+
+  Serial.printf(
+    "[BOOT] MODE=%d\n",
+    mode
+  );
+
+  Serial.println("==================================================");
+}
+
+// ================================================================
+// MAIN LOOP
+// ================================================================
+
+void loop(){
+
+  esp_task_wdt_reset();
+
+  showSplashScreen();
+  handleResetInputs();
+
+  unsigned long now=millis();
+
+  // ---------------- NORMAL CONTROL ----------------
+
+  if(!fault_latched){
+
+    if(now-t_control>=T_CONTROL){
+
+      t_control=now;
+
+      readSensors();
+
+      serviceSoftStart(I_pv);
+
+      checkProtections();
+
+      updateFSM();
+    }
+
+    // ---------------- LCD ----------------
+
+    if(now-t_lcd>=T_LCD){
+
+      t_lcd=now;
+
+      updateLCD();
+    }
+
+    // ---------------- SERIAL ----------------
+
+    if(now-t_ser>=T_SERIAL){
+
+      t_ser=now;
+
+      printSerial();
+    }
+
+    // ---------------- INA219 HEALTH ----------------
+
+    if(now-t_ina>=T_INA_CHECK){
+
+      t_ina=now;
+
+      ina1Ok=inaCheck(ina1);
+      ina2Ok=inaCheck(ina2);
+    }
+
+    // ---------------- BATTERY MONITOR ----------------
+
+    if(now-t_battery>=T_BATTERY){
+
+      t_battery=now;
+
+      updateBattery();
+    }
+
+  }else{
+
+    // ---------------- FAULT MODE ----------------
+
+    if(now-t_lcd>=T_LCD){
+
+      t_lcd=now;
+
+      updateLCD();
+    }
+
+    if(now-t_ser>=T_SERIAL){
+
+      t_ser=now;
+
+      printSerial();
+    }
+  }
+
+  delay(1);
+}
